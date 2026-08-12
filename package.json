@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --test --experimental-strip-types lib/**/*.test.ts",
+    "test": "node --test --experimental-strip-types \"lib/**/*.test.ts\"",
     "db:migrate": "node --experimental-strip-types lib/db/migrate.ts",
     "db:generate": "drizzle-kit generate",
     "docker:build": "docker build -t ac-dashboard .",

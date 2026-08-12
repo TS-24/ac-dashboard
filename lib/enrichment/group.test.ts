@@ -52,20 +52,36 @@ test("due dates 5 days apart do not cluster", () => {
   assert.equal(clusters.length, 2);
 });
 
-test("cluster caps at 5 members", () => {
+test("cluster caps at 5 members without discarding the overflow", () => {
   const items = Array.from({ length: 7 }, (_, i) =>
     makeTask({ id: String(i), title: "Same Task Batch", courseName: "BIO 101", dueAt: new Date("2026-08-20T23:59:00Z") }),
   );
   const clusters = candidateClusters(items);
   const maxSize = Math.max(...clusters.map((c) => c.length));
   assert.equal(maxSize, 5);
+
+  const clustered = clusters.flat().map((item) => item.id).sort();
+  assert.deepEqual(clustered, items.map((item) => item.id).sort());
 });
 
 test("existing card member pulls a new item into its cluster", () => {
-  const items = [
-    makeTask({ id: "1", title: "Homework 4", courseName: "CS 101", dueAt: new Date("2026-08-20T23:59:00Z") }),
-  ];
-  const existingMembers = [{ taskId: "1" }];
-  const clusters = candidateClusters(items, existingMembers);
+  const existing = makeTask({ id: "1", title: "Homework 4", courseName: "CS 101", dueAt: new Date("2026-08-20T23:59:00Z") });
+  const incoming = makeTask({ id: "2", title: "Homework 4 feedback", courseName: "CS 101", dueAt: new Date("2026-08-20T23:59:00Z"), sourceEntityType: "email" });
+
+  const withoutExisting = candidateClusters([incoming]);
+  assert.equal(withoutExisting.length, 1);
+  assert.equal(withoutExisting[0].length, 1);
+
+  const clusters = candidateClusters([incoming], [existing]);
   assert.equal(clusters.length, 1);
+  assert.deepEqual(clusters[0].map((item) => item.id).sort(), ["1", "2"]);
+});
+
+test("a cluster of only existing members is not returned", () => {
+  const existing = makeTask({ id: "1", title: "Homework 4", courseName: "CS 101" });
+  const unrelated = makeTask({ id: "2", title: "Completely different thing", courseName: "ART 300" });
+
+  const clusters = candidateClusters([unrelated], [existing]);
+  assert.equal(clusters.length, 1);
+  assert.deepEqual(clusters[0].map((item) => item.id), ["2"]);
 });

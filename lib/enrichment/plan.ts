@@ -22,6 +22,8 @@ export type CardPlan = {
   enrichmentStatus: "enriched" | "fallback";
   enrichmentModel: string | null;
   archivedReason?: string;
+  /** Cards absorbed by this one; their memberships move over and they are deleted. */
+  supersedesCardIds?: string[];
 };
 
 type ExistingCard = {
@@ -29,9 +31,16 @@ type ExistingCard = {
   items: { taskId: string; itemHash: string }[];
 };
 
-function pickPrimarySource(items: TaskRow[]): { primarySource: string; sourceUrl: string | null } {
-  const ranked = ["assignment", "calendar", "email"];
-  const sorted = [...items].sort((a, b) => ranked.indexOf(a.sourceEntityType) - ranked.indexOf(b.sourceEntityType));
+const sourceRanking = ["assignment", "calendar", "email"];
+
+// Unranked entity types sort last; indexOf's -1 would otherwise outrank assignments.
+function sourceRank(entityType: string): number {
+  const rank = sourceRanking.indexOf(entityType);
+  return rank === -1 ? sourceRanking.length : rank;
+}
+
+export function pickPrimarySource(items: TaskRow[]): { primarySource: string; sourceUrl: string | null } {
+  const sorted = [...items].sort((a, b) => sourceRank(a.sourceEntityType) - sourceRank(b.sourceEntityType));
   const first = sorted[0];
   return { primarySource: first?.source ?? "unknown", sourceUrl: first?.sourceUrl ?? null };
 }
@@ -94,7 +103,6 @@ export async function planCards(
   if (noModel) {
     const fallbackCards = new Map<string, { tasks: TaskRow[]; title: string }>();
     for (const task of candidates) {
-      itemHash(task);
       const existingEntry = existingByTaskId.get(task.id);
       const key = existingEntry?.cardId ?? task.id;
       if (!fallbackCards.has(key)) {
@@ -106,8 +114,10 @@ export async function planCards(
       const tasks = group.tasks;
       const { primarySource, sourceUrl } = pickPrimarySource(tasks);
       const hash = groupHash(tasks.map((t) => itemHash(t)));
+      const existingCardId = existingByTaskId.get(tasks[0].id)?.cardId;
       plans.push({
-        op: "create",
+        op: existingCardId ? "update" : "create",
+        cardId: existingCardId,
         taskIds: tasks.map((t) => t.id),
         title: group.title,
         summary: null,
@@ -153,41 +163,22 @@ export async function planCards(
 
   if (keepItems.length === 0) return plans;
 
-  const existingMemberIds = existing.flatMap((ec) => ec.items.map((i) => ({ taskId: i.taskId })));
-  const clusters = candidateClusters(keepItems, existingMemberIds);
-
-  const refdClusters: { ref: string; items: TaskRow[] }[] = clusters.map((cluster, i) => ({
-    ref: `g${i}`,
-    items: cluster,
-  }));
-
-  const confirmedStringGroups = await confirmGroups(enrichmentModel!, clusters);
+  const candidateIds = new Set(candidates.map((task) => task.id));
+  const existingMembers = tasks.filter((task) => existingByTaskId.has(task.id) && !candidateIds.has(task.id));
+  const clusters = candidateClusters(keepItems, existingMembers);
 
   const confirmedGroups: { ref: string; items: TaskRow[] }[] = [];
-  const stringToRef = new Map<string, string>();
+  const grouped = new Set<string>();
   let refCounter = 0;
-  for (const stringGroup of confirmedStringGroups) {
-    const items = stringGroup
-      .map((ref) => {
-        for (const rc of refdClusters) {
-          const found = rc.items.find((item) => ref.endsWith(`_i${rc.items.indexOf(item)}`));
-          if (found) return found;
-        }
-        return undefined;
-      })
-      .filter((item): item is TaskRow => item !== undefined);
+  for (const items of await confirmGroups(enrichmentModel!, clusters)) {
     if (items.length === 0) continue;
-    const ref = `h${refCounter++}`;
-    confirmedGroups.push({ ref, items });
-    for (const item of items) {
-      stringToRef.set(item.id, ref);
-    }
+    confirmedGroups.push({ ref: `h${refCounter++}`, items });
+    for (const item of items) grouped.add(item.id);
   }
 
-  const singletons = keepItems.filter((item) => !stringToRef.has(item.id));
-  for (const item of singletons) {
-    const ref = `h${refCounter++}`;
-    confirmedGroups.push({ ref, items: [item] });
+  for (const item of keepItems) {
+    if (grouped.has(item.id)) continue;
+    confirmedGroups.push({ ref: `h${refCounter++}`, items: [item] });
   }
 
   const phraseInput = confirmedGroups.map((g) => ({
@@ -203,27 +194,35 @@ export async function planCards(
     const existingIds = group.items.map((t) => existingByTaskId.get(t.id)?.cardId).filter(Boolean);
     const uniqueExistingIds = [...new Set(existingIds)];
 
-    if (uniqueExistingIds.length === 1) {
-      const existingCard = existing.find((ec) => ec.card.id === uniqueExistingIds[0]);
-      if (existingCard) {
-        const allTaskIds = new Set(existingCard.items.map((i) => i.taskId));
-        for (const t of group.items) allTaskIds.add(t.id);
-        plans.push({
-          op: "update",
-          cardId: existingCard.card.id,
-          taskIds: [...allTaskIds],
-          title: card?.title ?? group.items[0].title,
-          summary: card?.summary ?? null,
-          priority: derivePriority(earliestDue(group.items), now),
-          dueAt: earliestDue(group.items),
-          primarySource,
-          sourceUrl,
-          inputHash: hash,
-          enrichmentStatus: "enriched",
-          enrichmentModel: modelName,
-        });
-        continue;
-      }
+    // A group can span several existing cards once grouping merges them. One card
+    // absorbs the group and the rest are superseded, so no task_id is ever claimed
+    // by two cards at once.
+    const survivors = uniqueExistingIds
+      .map((id) => existing.find((ec) => ec.card.id === id))
+      .filter((ec): ec is ExistingCard => ec !== undefined);
+
+    if (survivors.length > 0) {
+      const [winner, ...superseded] = survivors;
+      const allTaskIds = new Set(winner.items.map((i) => i.taskId));
+      for (const ec of superseded) for (const i of ec.items) allTaskIds.add(i.taskId);
+      for (const t of group.items) allTaskIds.add(t.id);
+
+      plans.push({
+        op: "update",
+        cardId: winner.card.id,
+        taskIds: [...allTaskIds],
+        title: card?.title ?? group.items[0].title,
+        summary: card?.summary ?? null,
+        priority: derivePriority(earliestDue(group.items), now),
+        dueAt: earliestDue(group.items),
+        primarySource,
+        sourceUrl,
+        inputHash: hash,
+        enrichmentStatus: "enriched",
+        enrichmentModel: modelName,
+        supersedesCardIds: superseded.map((ec) => ec.card.id),
+      });
+      continue;
     }
 
     plans.push({

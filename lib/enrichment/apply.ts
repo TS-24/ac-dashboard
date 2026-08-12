@@ -16,6 +16,29 @@ function requireDb() {
   return db;
 }
 
+type Tx = Parameters<Parameters<NonNullable<typeof db>["transaction"]>[0]>[0];
+
+/**
+ * A task belongs to at most one card (card_items_task_idx). Detach these tasks from
+ * whichever card holds them before claiming them, and drop any card left with no
+ * items, so a regrouping never trips the unique index and aborts the transaction.
+ */
+async function releaseItems(tx: Tx, taskIds: string[]): Promise<void> {
+  if (taskIds.length === 0) return;
+
+  const held = await tx.select().from(cardItems).where(inArray(cardItems.taskId, taskIds));
+  if (held.length === 0) return;
+
+  await tx.delete(cardItems).where(inArray(cardItems.taskId, taskIds));
+
+  const touchedCardIds = [...new Set(held.map((item) => item.cardId))];
+  const remaining = await tx.select().from(cardItems).where(inArray(cardItems.cardId, touchedCardIds));
+  const stillPopulated = new Set(remaining.map((item) => item.cardId));
+  const emptied = touchedCardIds.filter((cardId) => !stillPopulated.has(cardId));
+
+  if (emptied.length > 0) await tx.delete(cards).where(inArray(cards.id, emptied));
+}
+
 export async function applyCardPlan(plans: CardPlan[]): Promise<ApplyResult> {
   if (plans.length === 0) return { created: 0, updated: 0, archived: 0, merged: 0 };
 
@@ -58,6 +81,7 @@ export async function applyCardPlan(plans: CardPlan[]): Promise<ApplyResult> {
           enrichedAt: new Date(),
         }).returning();
         if (plan.taskIds.length > 0) {
+          await releaseItems(tx, plan.taskIds);
           await tx.insert(cardItems).values(
             plan.taskIds.map((taskId) => ({
               cardId: card.id,
@@ -73,6 +97,10 @@ export async function applyCardPlan(plans: CardPlan[]): Promise<ApplyResult> {
       if (plan.op === "update" && plan.cardId) {
         const existingCard = await tx.select().from(cards).where(eq(cards.id, plan.cardId)).limit(1);
         if (existingCard[0]) {
+          if (plan.supersedesCardIds?.length) {
+            // Cascades their card_items away, freeing the task_ids for the winner.
+            await tx.delete(cards).where(inArray(cards.id, plan.supersedesCardIds));
+          }
           await tx.update(cards)
             .set({
               title: plan.title,
@@ -105,6 +133,7 @@ export async function applyCardPlan(plans: CardPlan[]): Promise<ApplyResult> {
 
           const toAdd = plan.taskIds.filter((tid) => !existingTaskIds.has(tid));
           if (toAdd.length > 0) {
+            await releaseItems(tx, toAdd);
             await tx.insert(cardItems).values(
               toAdd.map((taskId) => ({
                 cardId: plan.cardId!,
@@ -134,6 +163,7 @@ export async function applyCardPlan(plans: CardPlan[]): Promise<ApplyResult> {
       }).returning();
 
       if (plan.taskIds.length > 0) {
+        await releaseItems(tx, plan.taskIds);
         await tx.insert(cardItems).values(
           plan.taskIds.map((taskId) => ({
             cardId: card.id,

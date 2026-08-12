@@ -18,11 +18,11 @@ Items with different course names or due dates far apart should not be merged.`;
 export async function confirmGroups(
   model: LanguageModel,
   clusters: TaskRow[][],
-): Promise<string[][]> {
+): Promise<TaskRow[][]> {
   if (clusters.length === 0) return [];
 
   const BATCH_SIZE = 10;
-  const result: string[][] = [];
+  const result: TaskRow[][] = [];
 
   for (let offset = 0; offset < clusters.length; offset += BATCH_SIZE) {
     const batch = clusters.slice(offset, offset + BATCH_SIZE);
@@ -61,12 +61,12 @@ export async function confirmGroups(
       const validRefs = group.refs.filter((r) => refMap.has(r) && !seen.has(r));
       if (validRefs.length === 0) continue;
       for (const r of validRefs) seen.add(r);
-      result.push(validRefs);
+      result.push(validRefs.map((r) => refMap.get(r)!));
     }
 
     for (const ref of allRefs) {
       if (!seen.has(ref)) {
-        result.push([ref]);
+        result.push([refMap.get(ref)!]);
       }
     }
   }

@@ -1,5 +1,7 @@
 import type { TaskRow } from "../db/schema.ts";
 
+const MAX_CLUSTER_SIZE = 5;
+
 function normalizeCourseName(name: string | null): string {
   if (!name) return "";
   return name.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
@@ -29,56 +31,73 @@ function within48h(a: Date | null, b: Date | null): boolean {
   return Math.abs(a.getTime() - b.getTime()) <= 48 * 60 * 60 * 1000;
 }
 
-export function candidateClusters(items: TaskRow[], _existingMembers: { taskId: string }[] = []): TaskRow[][] {
-  void _existingMembers;
+/**
+ * Members already attached to a card are passed in so an incoming item can join
+ * the card it belongs to instead of spawning a duplicate. Clusters made up
+ * entirely of those members are dropped, since there is nothing new to enrich.
+ */
+export function candidateClusters(items: TaskRow[], existingMembers: TaskRow[] = []): TaskRow[][] {
+  const pool = [...items, ...existingMembers];
+  const isIncoming = pool.map((_, index) => index < items.length);
+  const blockOf = pool.map((item) => normalizeCourseName(item.courseName) || "__uncoursed__");
+  const tokensOf = pool.map((item) => tokenize(item.title));
 
-  type BlockedItem = { item: TaskRow; block: string; tokens: string[] };
-  const blocked: BlockedItem[] = items.map((item) => ({
-    item,
-    block: normalizeCourseName(item.courseName),
-    tokens: tokenize(item.title),
-  }));
+  const parent = pool.map((_, index) => index);
+  const size = pool.map(() => 1);
 
-  const blocks = new Map<string, BlockedItem[]>();
-  for (const b of blocked) {
-    const key = b.block || "__uncoursed__";
-    if (!blocks.has(key)) blocks.set(key, []);
-    blocks.get(key)!.push(b);
+  const find = (index: number): number => {
+    let root = index;
+    while (parent[root] !== root) root = parent[root];
+    for (let cursor = index; parent[cursor] !== root; ) {
+      const next = parent[cursor];
+      parent[cursor] = root;
+      cursor = next;
+    }
+    return root;
+  };
+
+  // Refusing the union keeps the overflow in its own cluster rather than
+  // truncating a cluster and silently dropping the items past the cap.
+  const union = (a: number, b: number) => {
+    const rootA = find(a);
+    const rootB = find(b);
+    if (rootA === rootB) return;
+    if (size[rootA] + size[rootB] > MAX_CLUSTER_SIZE) return;
+    parent[rootA] = rootB;
+    size[rootB] += size[rootA];
+  };
+
+  const blocks = new Map<string, number[]>();
+  for (let index = 0; index < pool.length; index++) {
+    const block = blocks.get(blockOf[index]);
+    if (block) block.push(index);
+    else blocks.set(blockOf[index], [index]);
   }
 
-  const parent = new Map<number, number>();
-  const itemsArr = blocked;
-  const find = (i: number): number => {
-    if (!parent.has(i)) parent.set(i, i);
-    if (parent.get(i) !== i) parent.set(i, find(parent.get(i)!));
-    return parent.get(i)!;
-  };
-  const union = (a: number, b: number) => {
-    const ra = find(a), rb = find(b);
-    if (ra !== rb) parent.set(ra, rb);
-  };
-
-  for (const [, blockItems] of blocks) {
-    for (let i = 0; i < blockItems.length; i++) {
-      for (let j = i + 1; j < blockItems.length; j++) {
-        const a = blockItems[i], b = blockItems[j];
-        if (within48h(a.item.dueAt, b.item.dueAt) && jaccardSimilarity(a.tokens, b.tokens) >= 0.3) {
-          union(itemsArr.indexOf(a), itemsArr.indexOf(b));
+  for (const indices of blocks.values()) {
+    for (let i = 0; i < indices.length; i++) {
+      for (let j = i + 1; j < indices.length; j++) {
+        const a = indices[i];
+        const b = indices[j];
+        if (within48h(pool[a].dueAt, pool[b].dueAt) && jaccardSimilarity(tokensOf[a], tokensOf[b]) >= 0.3) {
+          union(a, b);
         }
       }
     }
   }
 
-  const clusterMap = new Map<number, TaskRow[]>();
-  for (let i = 0; i < itemsArr.length; i++) {
-    const root = find(i);
-    if (!clusterMap.has(root)) clusterMap.set(root, []);
-    clusterMap.get(root)!.push(itemsArr[i].item);
+  const clusters = new Map<number, number[]>();
+  for (let index = 0; index < pool.length; index++) {
+    const root = find(index);
+    const cluster = clusters.get(root);
+    if (cluster) cluster.push(index);
+    else clusters.set(root, [index]);
   }
 
   const result: TaskRow[][] = [];
-  for (const [, group] of clusterMap) {
-    result.push(group.slice(0, 5));
+  for (const indices of clusters.values()) {
+    if (!indices.some((index) => isIncoming[index])) continue;
+    result.push(indices.map((index) => pool[index]));
   }
 
   return result;
