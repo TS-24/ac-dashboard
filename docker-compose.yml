@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dashboard
+      POSTGRES_PASSWORD: dashboard
+      POSTGRES_DB: dashboard
+    ports:
+      - "5433:5432"
+    volumes:
+      - dashboard_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dashboard -d dashboard"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  next-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://dashboard:dashboard@postgres:5432/dashboard}
+      PKS_API_URL: ${PKS_API_URL:-http://host.docker.internal:8001/api/v1}
+      PKS_API_KEY: ${PKS_API_KEY:-}
+      SYNC_ON_STARTUP: ${SYNC_ON_STARTUP:-false}
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_MODEL: ${HF_MODEL:-openai/gpt-oss-120b:cheapest}
+      HF_BASE_URL: ${HF_BASE_URL:-https://router.huggingface.co/v1}
+      ENRICHMENT_ENABLED: ${ENRICHMENT_ENABLED:-false}
+      ENRICHMENT_MAX_ITEMS: ${ENRICHMENT_MAX_ITEMS:-200}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  dashboard_postgres_data:
