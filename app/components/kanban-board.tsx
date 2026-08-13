@@ -1,13 +1,16 @@
 "use client";
 
-import { useEffect, useState, type DragEvent } from "react";
+import { useEffect, useRef, useState, type DragEvent } from "react";
 
-import { boardColumns, type BoardColumn } from "../dashboard-data";
-import { moveCard, reorderCard } from "../../lib/kanban-state";
+import { boardColumns, type BoardColumn, type Card } from "../dashboard-data";
+import { columnForStatus, moveCard, reorderCard, statusForColumn } from "../../lib/kanban-state";
 import { TaskCard } from "./task-card";
 
 const colorClasses: Record<string, string> = { slate: "column-slate", blue: "column-blue", amber: "column-amber", green: "column-green" };
 type DropTarget = { column: string; index: number } | null;
+
+/** A card the server has not acknowledged yet has no real id to PATCH against. */
+const isPending = (cardId: string) => cardId.startsWith("temp-");
 
 function initialBoard(): BoardColumn[] {
   return boardColumns.map((column) => ({ ...column, cards: [], count: 0 }));
@@ -16,8 +19,7 @@ function initialBoard(): BoardColumn[] {
 function applyRows(rows: Record<string, unknown>[]): BoardColumn[] {
   const next = initialBoard();
   for (const row of rows) {
-    const status = row.kanbanStatus === "in_progress" ? "In progress" : row.kanbanStatus === "review" ? "Review" : row.kanbanStatus === "done" ? "Done" : "Backlog";
-    const column = next.find((candidate) => candidate.title === status);
+    const column = next.find((candidate) => candidate.title === columnForStatus(String(row.kanbanStatus)));
     if (!column) continue;
     column.cards.push({
       id: String(row.id),
@@ -26,7 +28,7 @@ function applyRows(rows: Record<string, unknown>[]): BoardColumn[] {
       source: String(row.primarySource),
       priority: row.priority === "high" ? "high" : row.priority === "low" ? "low" : "medium",
       due: row.dueAt ? new Date(String(row.dueAt)).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "No due date",
-      tag: "Assignment",
+      tag: row.primarySource === "Manual" ? "Task" : "Assignment",
       owner: "",
       avatar: "",
       avatarColor: "#eeeae5",
@@ -46,6 +48,80 @@ export function KanbanBoard() {
   const [dropTarget, setDropTarget] = useState<DropTarget>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [addingColumn, setAddingColumn] = useState<string | null>(null);
+  const [newTaskTitle, setNewTaskTitle] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const columnsRef = useRef(columns);
+  const tempIdRef = useRef(0);
+
+  useEffect(() => { columnsRef.current = columns; }, [columns]);
+  useEffect(() => {
+    if (addingColumn && inputRef.current) inputRef.current.focus();
+  }, [addingColumn]);
+
+  const handleAddTask = (columnTitle: string) => {
+    const title = newTaskTitle.trim();
+    if (!title) return;
+    setAddingColumn(null);
+    setNewTaskTitle("");
+
+    const snapshot = columnsRef.current;
+
+    const optimistic: Card = {
+      id: `temp-${++tempIdRef.current}`,
+      title,
+      summary: null,
+      source: "Manual",
+      priority: "medium",
+      due: "No due date",
+      tag: "Task",
+      owner: "",
+      avatar: "",
+      avatarColor: "#eeeae5",
+      position: (snapshot.find((c) => c.title === columnTitle)?.cards.length ?? 0),
+      sourceUrl: null,
+      enrichmentStatus: "pending",
+      itemCount: 1,
+    };
+
+    setColumns((prev) =>
+      prev.map((col) =>
+        col.title === columnTitle
+          ? { ...col, cards: [...col.cards, optimistic], count: col.cards.length + 1 }
+          : col,
+      ),
+    );
+
+    void (async () => {
+      try {
+        const response = await fetch("/api/cards", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title, kanban_status: statusForColumn(columnTitle) }),
+        });
+        if (!response.ok) throw new Error("Failed to create card");
+        const created = (await response.json()) as Record<string, unknown>;
+        setColumns((prev) =>
+          prev.map((col) =>
+            col.title === columnTitle
+              ? {
+                  ...col,
+                  cards: col.cards.map((card) =>
+                    card.id === optimistic.id
+                      ? { ...card, id: String(created.id), sourceUrl: created.sourceUrl ? String(created.sourceUrl) : null }
+                      : card,
+                  ),
+                }
+              : col,
+          ),
+        );
+      } catch {
+        setColumns(snapshot);
+        setError("Could not create task");
+      }
+    })();
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -54,8 +130,7 @@ export function KanbanBoard() {
   }, []);
 
   const persistBoard = async (next: BoardColumn[]) => {
-    const statusByTitle: Record<string, string> = { Backlog: "backlog", "In progress": "in_progress", Review: "review", Done: "done" };
-    const responses = await Promise.all(next.flatMap((column) => column.cards.map((card, position) => fetch(`/api/cards/${card.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kanban_status: statusByTitle[column.title], position }) }))));
+    const responses = await Promise.all(next.flatMap((column) => column.cards.map((card, position) => [card, position] as const).filter(([card]) => !isPending(card.id)).map(([card, position]) => fetch(`/api/cards/${card.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kanban_status: statusForColumn(column.title), position }) }))));
     if (responses.some((response) => !response.ok)) throw new Error("Could not save board changes");
   };
 
@@ -82,5 +157,5 @@ export function KanbanBoard() {
   const handleDragEnd = () => { setDraggedCardId(null); setDropTarget(null); };
   const activeCardCount = columns.filter((column) => column.title !== "Done").reduce((total, column) => total + column.cards.length, 0);
 
-  return <section className="board-section" id="board" aria-labelledby="board-title"><div className="section-title-row board-title-row"><div><p className="eyebrow">The days ahead</p><h2 id="board-title">Your board</h2></div><span className="board-count">{activeCardCount} active tasks</span></div>{loading ? <p className="board-message">Loading your tasks…</p> : error ? <p className="board-message board-error">{error}</p> : <div className="kanban-board">{columns.map((column) => <div className={`kanban-column${dropTarget?.column === column.title ? " column-drop-target" : ""}`} key={column.title} onDragOver={(event) => handleDragOverColumn(event, column)} onDrop={(event) => handleDrop(event, column.title)}><div className="column-heading"><div className={`column-indicator ${colorClasses[column.color]}`} /><h3>{column.title}</h3><span className="column-count">{column.count}</span></div><div className="task-list">{column.cards.map((card, index) => <TaskCard key={card.id} card={card} complete={column.title === "Done"} isDragging={draggedCardId === card.id} isDropTarget={dropTarget?.column === column.title && dropTarget.index === index} draggable onDragStart={(event) => handleDragStart(event, card.id)} onDragEnd={handleDragEnd} onDragOver={(event) => handleDragOverCard(event, column, index)} onDrop={(event) => handleDrop(event, column.title, index)} />)}<button className="add-card-button">+ Add a task</button></div></div>)}</div>}</section>;
+  return <section className="board-section" id="board" aria-labelledby="board-title"><div className="section-title-row board-title-row"><div><p className="eyebrow">The days ahead</p><h2 id="board-title">Your board</h2></div><span className="board-count">{activeCardCount} active tasks</span></div>{loading ? <p className="board-message">Loading your tasks…</p> : error ? <p className="board-message board-error">{error}</p> : <div className="kanban-board">{columns.map((column) => <div className={`kanban-column${dropTarget?.column === column.title ? " column-drop-target" : ""}`} key={column.title} onDragOver={(event) => handleDragOverColumn(event, column)} onDrop={(event) => handleDrop(event, column.title)}><div className="column-heading"><div className={`column-indicator ${colorClasses[column.color]}`} /><h3>{column.title}</h3><span className="column-count">{column.count}</span></div><div className="task-list">{column.cards.map((card, index) => <TaskCard key={card.id} card={card} complete={column.title === "Done"} isDragging={draggedCardId === card.id} isDropTarget={dropTarget?.column === column.title && dropTarget.index === index} draggable={!isPending(card.id)} onDragStart={(event) => handleDragStart(event, card.id)} onDragEnd={handleDragEnd} onDragOver={(event) => handleDragOverCard(event, column, index)} onDrop={(event) => handleDrop(event, column.title, index)} />)}{addingColumn === column.title ? <form className="add-task-form" onSubmit={(event) => { event.preventDefault(); handleAddTask(column.title); }} onKeyDown={(event) => { if (event.key === "Escape") { setAddingColumn(null); setNewTaskTitle(""); } }}><input ref={inputRef} className="add-task-input" type="text" placeholder="Task title…" value={newTaskTitle} onChange={(event) => setNewTaskTitle(event.target.value)} /><div className="add-task-actions"><button className="add-task-submit" type="submit" disabled={!newTaskTitle.trim()}>Add</button><button className="add-task-cancel" type="button" onClick={() => { setAddingColumn(null); setNewTaskTitle(""); }}>Cancel</button></div></form> : <button className="add-card-button" onClick={() => setAddingColumn(column.title)}>+ Add a task</button>}</div></div>)}</div>}</section>;
 }

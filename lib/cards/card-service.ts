@@ -1,7 +1,9 @@
-import { asc, eq, isNull } from "drizzle-orm";
+import { createHash } from "node:crypto";
+
+import { and, asc, desc, eq, isNull } from "drizzle-orm";
 
 import { db } from "../db/client.ts";
-import { cardItems, cards, type CardRow } from "../db/schema.ts";
+import { cardItems, cards, type CardRow, type NewCard } from "../db/schema.ts";
 
 export type CardWithCount = CardRow & { itemCount: number };
 
@@ -11,6 +13,48 @@ export type CardPriority = "high" | "medium" | "low";
 function requireDb() {
   if (!db) throw new Error("DATABASE_URL is required");
   return db;
+}
+
+export async function createCard(input: {
+  title: string;
+  summary?: string | null;
+  priority?: CardPriority;
+  dueAt?: Date | null;
+  kanbanStatus?: CardStatus;
+}): Promise<CardRow> {
+  const hash = createHash("sha256")
+    .update(input.title)
+    .update("\0")
+    .update(input.summary ?? "")
+    .update("\0")
+    .update(Date.now().toString())
+    .digest("hex");
+
+  const database = requireDb();
+  const kanbanStatus = input.kanbanStatus ?? "backlog";
+
+  // The board appends new cards to the bottom of a column, so the stored position
+  // has to land past every sibling or a reload would sort it back to the top.
+  const [last] = await database
+    .select({ position: cards.position })
+    .from(cards)
+    .where(and(eq(cards.kanbanStatus, kanbanStatus), isNull(cards.archivedAt)))
+    .orderBy(desc(cards.position))
+    .limit(1);
+
+  const value: NewCard = {
+    title: input.title,
+    summary: input.summary ?? null,
+    priority: input.priority ?? "medium",
+    dueAt: input.dueAt ?? null,
+    kanbanStatus,
+    position: last ? last.position + 1 : 0,
+    primarySource: "Manual",
+    inputHash: hash,
+  };
+
+  const [card] = await database.insert(cards).values(value).returning();
+  return card;
 }
 
 export async function listCards(): Promise<CardWithCount[]> {

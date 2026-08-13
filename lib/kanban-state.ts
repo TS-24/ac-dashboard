@@ -1,5 +1,24 @@
 import type { BoardColumn } from "../app/dashboard-data.ts";
 
+const columnTitleByStatus: Record<string, string> = {
+  backlog: "Backlog",
+  in_progress: "In progress",
+  review: "Review",
+  done: "Done",
+};
+
+const statusByColumnTitle: Record<string, string> = Object.fromEntries(
+  Object.entries(columnTitleByStatus).map(([status, title]) => [title, status]),
+);
+
+export function statusForColumn(columnTitle: string): string {
+  return statusByColumnTitle[columnTitle] ?? "backlog";
+}
+
+export function columnForStatus(status: string): string {
+  return columnTitleByStatus[status] ?? "Backlog";
+}
+
 function cloneColumns(columns: BoardColumn[]): BoardColumn[] {
   return columns.map((column) => ({
     ...column,

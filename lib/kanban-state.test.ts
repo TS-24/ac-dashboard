@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { boardColumns, type BoardColumn, type Card } from "../app/dashboard-data.ts";
-import { moveCard, reorderCard } from "./kanban-state.ts";
+import { columnForStatus, moveCard, reorderCard, statusForColumn } from "./kanban-state.ts";
 
 const sampleCard = (id: string, title: string): Card => ({
   id, title, summary: null, source: "Coursework", priority: "medium",
@@ -48,4 +48,15 @@ test("ignores invalid card and destination identifiers", () => {
 
   assert.deepEqual(moveCard(original, "missing", "Done"), original);
   assert.deepEqual(moveCard(original, "task-1", "Missing"), original);
+});
+
+test("maps every board column to a kanban status and back", () => {
+  for (const column of boardColumns) {
+    assert.equal(columnForStatus(statusForColumn(column.title)), column.title);
+  }
+});
+
+test("unknown column titles and statuses fall back to backlog", () => {
+  assert.equal(statusForColumn("Nonexistent"), "backlog");
+  assert.equal(columnForStatus("nonexistent"), "Backlog");
 });
